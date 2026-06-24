@@ -13,11 +13,9 @@ import com.revvivii.mydentapp.ui.CameraScreen
 
 class MainActivity : ComponentActivity() {
 
-    // Lanzador del diálogo de permisos de cámara
     private val cameraPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        // Actualiza el estado cuando el usuario responde al diálogo
         hasCameraPermission = granted
     }
 
@@ -26,19 +24,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Verifica si ya tiene permiso
         hasCameraPermission = ContextCompat.checkSelfPermission(
             this, Manifest.permission.CAMERA
         ) == PackageManager.PERMISSION_GRANTED
 
-        // Si no tiene permiso, lo pide
         if (!hasCameraPermission) {
             cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
 
         setContent {
             MyDentAppTheme {
-                // Pasa el estado del permiso a la UI
                 CameraScreen(hasCameraPermission = hasCameraPermission)
             }
         }

@@ -8,223 +8,245 @@ import com.google.mlkit.vision.facemesh.FaceMeshDetection
 import com.google.mlkit.vision.facemesh.FaceMeshDetectorOptions
 import com.google.mlkit.vision.facemesh.FaceMeshPoint
 import com.revvivii.mydentapp.model.MeasurementResult
+import com.revvivii.mydentapp.model.OpeningPattern
+import com.revvivii.mydentapp.ui.OVAL_CENTER_Y_RATIO
+import com.revvivii.mydentapp.ui.OVAL_HEIGHT_RATIO
+import com.revvivii.mydentapp.ui.OVAL_WIDTH_RATIO
 import kotlin.math.abs
+import kotlin.math.pow
 import kotlin.math.sqrt
 
-/**
- * Analizador de frames de cámara usando ML Kit Face Mesh.
- *
- * ML Kit detecta 468 puntos (landmarks) en el rostro.
- * Usamos los índices específicos de los labios para medir la apertura bucal.
- *
- * Índices clave del mapa facial de MediaPipe/ML Kit:
- *   - 13  → centro labio superior (interior)
- *   - 14  → centro labio inferior (interior)
- *   - 33  → comisura izquierda del ojo (para referencia de escala)
- *   - 263 → comisura derecha del ojo (para referencia de escala)
- *   - 168 → punta de la nariz (para verificar orientación)
- *
- * La medición se hace así:
- *   1. Distancia en píxeles entre punto 13 y 14 = apertura en px
- *   2. Distancia en px entre esquinas oculares = IPD en px
- *   3. IPD real promedio en adultos = ~63 mm
- *   4. Escala = 63 / IPD_px  →  mm_por_px
- *   5. Apertura_mm = apertura_px * mm_por_px
- */
 class FaceMeshAnalyzer(
+    private val useFrontCamera: Boolean,
     private val onResult: (MeasurementResult) -> Unit
 ) : ImageAnalysis.Analyzer {
 
-    // Índices de los landmarks que nos interesan
     companion object {
-        const val UPPER_LIP_CENTER = 13   // interior labio superior
-        const val LOWER_LIP_CENTER = 14   // interior labio inferior
-        const val LEFT_EYE_CORNER  = 33   // esquina exterior ojo izquierdo
-        const val RIGHT_EYE_CORNER = 263  // esquina exterior ojo derecho
-        const val NOSE_TIP         = 168  // punta de la nariz
+        const val UPPER_LIP_CENTER   = 13
+        const val LOWER_LIP_CENTER   = 14
+        const val LEFT_EYE_CORNER    = 33
+        const val RIGHT_EYE_CORNER   = 263
+        const val LEFT_MOUTH_CORNER  = 61
+        const val RIGHT_MOUTH_CORNER = 291
 
-        // IPD (Inter-Pupillary Distance) promedio en adultos en mm
-        // Usamos 63 mm como referencia estándar de calibración
-        const val AVERAGE_IPD_MM = 63.0f
-
-        // Tolerancia de inclinación máxima permitida (en px de diferencia vertical entre ojos)
-        const val MAX_TILT_PX = 30f
+        const val AVERAGE_IPD_MM     = 63.0f
+        const val MAX_TILT_PX        = 40f
+        const val PEAK_WINDOW        = 12
+        const val MIN_OPEN_MM        = 8
+        const val OVAL_MARGIN        = 0.20f
+        const val DENTAL_OFFSET_MM   = 2
     }
 
-    // Detector de ML Kit configurado para face mesh completo
     private val detector = FaceMeshDetection.getClient(
         FaceMeshDetectorOptions.Builder()
             .setUseCase(FaceMeshDetectorOptions.FACE_MESH)
             .build()
     )
 
+    private val recentOpenings = ArrayDeque<Int>(PEAK_WINDOW)
+    private val currentTrajectory = mutableListOf<Float>()
+    private var lastPeakResult: MeasurementResult? = null
+    private var frameCount = 0
+
     @androidx.camera.core.ExperimentalGetImage
     override fun analyze(imageProxy: ImageProxy) {
+        frameCount++
+        if (frameCount % 2 != 0) {
+            imageProxy.close()
+            return
+        }
+
         val mediaImage = imageProxy.image ?: run {
             imageProxy.close()
             return
         }
 
-        val image = InputImage.fromMediaImage(
-            mediaImage,
-            imageProxy.imageInfo.rotationDegrees
-        )
+        val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+        val image = InputImage.fromMediaImage(mediaImage, rotationDegrees)
 
         detector.process(image)
             .addOnSuccessListener { faceMeshes ->
                 if (faceMeshes.isEmpty()) {
-                    // No se detectó ningún rostro
-                    onResult(
-                        MeasurementResult(
-                            openingMm = 0,
-                            isAligned = false,
-                            alignmentMessage = "Coloca tu rostro en el óvalo"
-                        )
-                    )
+                    resetTrajectory()
+                    onResult(MeasurementResult(openingMm = 0, isAligned = false, alignmentMessage = "Coloca tu rostro en el óvalo"))
                     imageProxy.close()
                     return@addOnSuccessListener
                 }
 
-                // Tomamos el primer rostro detectado
-                val mesh = faceMeshes[0]
+                val mesh   = faceMeshes[0]
                 val points = mesh.allPoints
 
-                // Extraemos los puntos que necesitamos
-                val upperLip = points.getOrNull(UPPER_LIP_CENTER)
-                val lowerLip = points.getOrNull(LOWER_LIP_CENTER)
-                val leftEye  = points.getOrNull(LEFT_EYE_CORNER)
-                val rightEye = points.getOrNull(RIGHT_EYE_CORNER)
+                val upperLip   = points.getOrNull(UPPER_LIP_CENTER)
+                val lowerLip   = points.getOrNull(LOWER_LIP_CENTER)
+                val leftEye    = points.getOrNull(LEFT_EYE_CORNER)
+                val rightEye   = points.getOrNull(RIGHT_EYE_CORNER)
+                val leftMouth  = points.getOrNull(LEFT_MOUTH_CORNER)
+                val rightMouth = points.getOrNull(RIGHT_MOUTH_CORNER)
 
                 if (upperLip == null || lowerLip == null || leftEye == null || rightEye == null) {
                     imageProxy.close()
                     return@addOnSuccessListener
                 }
 
-                // ── 1. Verificar alineación del rostro ──────────────────
-                val alignmentCheck = checkAlignment(leftEye, rightEye, imageProxy)
+                val isRotated = rotationDegrees == 90 || rotationDegrees == 270
+                val imgW = if (isRotated) imageProxy.height.toFloat() else imageProxy.width.toFloat()
+                val imgH = if (isRotated) imageProxy.width.toFloat() else imageProxy.height.toFloat()
 
-                if (!alignmentCheck.first) {
-                    // Rostro detectado pero mal alineado
-                    onResult(
-                        MeasurementResult(
-                            openingMm = 0,
-                            isAligned = false,
-                            alignmentMessage = alignmentCheck.second
-                        )
-                    )
+                // ── 1. Validar Óvalo ──────
+                val ovalCx = imgW / 2f
+                val ovalCy = imgH * OVAL_CENTER_Y_RATIO
+                val semiA  = (imgW * OVAL_WIDTH_RATIO  / 2f) * (1f + OVAL_MARGIN)
+                val semiB  = (imgH * OVAL_HEIGHT_RATIO / 2f) * (1f + OVAL_MARGIN)
+
+                val pointsToCheck = listOfNotNull(leftEye, rightEye, upperLip, lowerLip)
+                val faceInsideOval = pointsToCheck.all { p ->
+                    isInsideOval(p.position.x, p.position.y, ovalCx, ovalCy, semiA, semiB)
+                }
+
+                if (!faceInsideOval) {
+                    resetTrajectory()
+                    onResult(MeasurementResult(openingMm = 0, isAligned = false, alignmentMessage = "Ajusta tu cara dentro del óvalo"))
                     imageProxy.close()
                     return@addOnSuccessListener
                 }
 
-                // ── 2. Calcular escala usando IPD ───────────────────────
+                // ── 2. Validar Inclinación ──────
+                val verticalDiff = abs(leftEye.position.y - rightEye.position.y)
+                if (verticalDiff > MAX_TILT_PX) {
+                    onResult(MeasurementResult(openingMm = 0, isAligned = false, alignmentMessage = "Endereza la cabeza (no la inclines)"))
+                    imageProxy.close()
+                    return@addOnSuccessListener
+                }
+
+                // ── 3. Escala IPD ──────
                 val ipdPx = distance2D(leftEye, rightEye)
-                if (ipdPx < 10f) {
-                    // Rostro demasiado lejos o pequeño
-                    onResult(
-                        MeasurementResult(
-                            openingMm = 0,
-                            isAligned = false,
-                            alignmentMessage = "Acércate un poco más"
-                        )
-                    )
+                if (ipdPx < 20f) {
                     imageProxy.close()
                     return@addOnSuccessListener
                 }
-
                 val mmPerPx = AVERAGE_IPD_MM / ipdPx
 
-                // ── 3. Medir apertura bucal ─────────────────────────────
+                // ── 4. Apertura ──────
                 val openingPx = distance2D(upperLip, lowerLip)
-                val openingMm = (openingPx * mmPerPx).toInt()
+                val baseOpeningMm = (openingPx * mmPerPx).toInt()
+                val openingMm = if (baseOpeningMm > MIN_OPEN_MM) baseOpeningMm + DENTAL_OFFSET_MM else baseOpeningMm
 
-                // ── 4. Calcular confianza ───────────────────────────────
-                // La confianza sube cuando el IPD es más grande (rostro más cerca y nítido)
-                val confidence = calculateConfidence(ipdPx)
+                val confidence = when {
+                    ipdPx < 120 -> 65
+                    ipdPx < 180 -> 85
+                    else -> 98
+                }
 
-                // ── 5. Escalar coordenadas a la pantalla para el overlay ─
-                // ML Kit devuelve coordenadas en el espacio de la imagen original
-                // Necesitamos escalarlas al tamaño de la vista de pantalla
-                val scaleX = imageProxy.width.toFloat()
-                val scaleY = imageProxy.height.toFloat()
+                // ── 5. Desviación Horizontal ──────
+                val faceCenterX = (leftEye.position.x + rightEye.position.x) / 2f
+                val mouthCenterX = if (leftMouth != null && rightMouth != null)
+                    (leftMouth.position.x + rightMouth.position.x) / 2f
+                else
+                    (upperLip.position.x + lowerLip.position.x) / 2f
 
-                val upperLipScreen = Offset(
-                    upperLip.position.x / scaleX,
-                    upperLip.position.y / scaleY
+                val rawDeviationPx = mouthCenterX - faceCenterX
+                val correctedDeviationPx = if (useFrontCamera) rawDeviationPx * -1f else rawDeviationPx
+                val deviationMm = correctedDeviationPx * mmPerPx
+
+                val deviationDir = when {
+                    abs(deviationMm) < 1.5f -> "Centro"
+                    deviationMm > 0 -> "Derecha"
+                    else -> "Izquierda"
+                }
+
+                // ── 6. Trayectoria ──────
+                if (baseOpeningMm > MIN_OPEN_MM) {
+                    currentTrajectory.add(deviationMm)
+                } else {
+                    if (currentTrajectory.size > 3) currentTrajectory.clear()
+                }
+
+                val currentPattern = analyzePattern(currentTrajectory, deviationMm)
+
+                fun FaceMeshPoint.toNorm() = Offset(position.x / imgW, position.y / imgH)
+                val upperLipSc   = upperLip.toNorm()
+                val lowerLipSc   = lowerLip.toNorm()
+                val leftMouthSc  = leftMouth?.toNorm()
+                val rightMouthSc = rightMouth?.toNorm()
+                val midpointSc   = if (leftMouthSc != null && rightMouthSc != null)
+                    Offset((leftMouthSc.x + rightMouthSc.x) / 2f, (leftMouthSc.y + rightMouthSc.y) / 2f)
+                else null
+
+                val currentResult = MeasurementResult(
+                    openingMm           = openingMm,
+                    isAligned           = true,
+                    upperLipScreen      = upperLipSc,
+                    lowerLipScreen      = lowerLipSc,
+                    leftMouthScreen     = leftMouthSc,
+                    rightMouthScreen    = rightMouthSc,
+                    mouthMidpointScreen = midpointSc,
+                    deviationMm         = deviationMm,
+                    deviationDirection  = deviationDir,
+                    confidence          = confidence,
+                    trajectoryHistory   = ArrayList(currentTrajectory),
+                    detectedPattern     = currentPattern
                 )
-                val lowerLipScreen = Offset(
-                    lowerLip.position.x / scaleX,
-                    lowerLip.position.y / scaleY
-                )
 
-                onResult(
-                    MeasurementResult(
-                        openingMm = openingMm,
-                        isAligned = true,
-                        upperLipScreen = upperLipScreen,
-                        lowerLipScreen = lowerLipScreen,
-                        confidence = confidence
-                    )
-                )
+                // ── 7. Pico Máximo ──────
+                if (openingMm >= MIN_OPEN_MM) {
+                    if (recentOpenings.size >= PEAK_WINDOW) recentOpenings.removeFirst()
+                    recentOpenings.addLast(openingMm)
 
+                    val peakInWindow = recentOpenings.max()
+                    if (recentOpenings.size >= 3 && openingMm == peakInWindow && openingMm > (recentOpenings.dropLast(1).maxOrNull() ?: 0)) {
+                        lastPeakResult = currentResult.copy(isPeakCapture = true)
+                    }
+                }
+
+                onResult(currentResult)
                 imageProxy.close()
             }
-            .addOnFailureListener {
-                imageProxy.close()
+            .addOnFailureListener { imageProxy.close() }
+    }
+
+    private fun analyzePattern(trajectory: List<Float>, currentDev: Float): OpeningPattern {
+        if (trajectory.size < 5) return OpeningPattern.RECTILINEO
+
+        val maxDeviation = trajectory.maxOf { abs(it) }
+        val finalDeviation = abs(currentDev)
+
+        return if (maxDeviation < 2.0f) {
+            OpeningPattern.RECTILINEO
+        } else if (finalDeviation >= 2.0f && abs(maxDeviation - finalDeviation) < 1.5f) {
+            OpeningPattern.DEFLEXION
+        } else {
+            val crossings = countZeroCrossings(trajectory)
+            if (crossings >= 1) OpeningPattern.DESVIACION_S else OpeningPattern.DESVIACION_C
+        }
+    }
+
+    private fun countZeroCrossings(list: List<Float>): Int {
+        var crossings = 0
+        for (i in 0 until list.size - 1) {
+            if ((list[i] >= 0f && list[i+1] < 0f) || (list[i] < 0f && list[i+1] >= 0f)) {
+                crossings++
             }
+        }
+        return crossings
     }
 
-    /**
-     * Verifica que el rostro esté:
-     * 1. Razonablemente de frente (no muy inclinado)
-     * 2. No demasiado ladeado horizontalmente
-     *
-     * @return Pair(esValido, mensajeDeError)
-     */
-    private fun checkAlignment(
-        leftEye: FaceMeshPoint,
-        rightEye: FaceMeshPoint,
-        imageProxy: ImageProxy
-    ): Pair<Boolean, String> {
-
-        // Diferencia vertical entre ojos → inclinación de cabeza
-        val verticalDiff = abs(leftEye.position.y - rightEye.position.y)
-        if (verticalDiff > MAX_TILT_PX) {
-            return Pair(false, "Endereza la cabeza (no inclines)")
-        }
-
-        // Verificar que los ojos estén aproximadamente centrados en la imagen
-        val eyeCenterX = (leftEye.position.x + rightEye.position.x) / 2f
-        val imageCenter = imageProxy.width / 2f
-        val horizontalOffset = abs(eyeCenterX - imageCenter)
-
-        if (horizontalOffset > imageProxy.width * 0.25f) {
-            return Pair(false, "Centra tu rostro en el óvalo")
-        }
-
-        return Pair(true, "")
+    private fun resetTrajectory() {
+        recentOpenings.clear()
+        currentTrajectory.clear()
+        lastPeakResult = null
     }
 
-    /**
-     * Distancia euclidiana entre dos puntos del mesh en 2D (x, y)
-     */
+    private fun isInsideOval(px: Float, py: Float, cx: Float, cy: Float, a: Float, b: Float): Boolean {
+        return ((px - cx) / a).pow(2) + ((py - cy) / b).pow(2) <= 1.0f
+    }
+
     private fun distance2D(a: FaceMeshPoint, b: FaceMeshPoint): Float {
-        val dx = a.position.x - b.position.x
-        val dy = a.position.y - b.position.y
-        return sqrt(dx * dx + dy * dy)
+        return sqrt((a.position.x - b.position.x).pow(2) + (a.position.y - b.position.y).pow(2))
     }
 
-    /**
-     * Calcula la confianza de la medición según qué tan grande
-     * se ve el rostro en pantalla.
-     * - IPD < 80px → baja confianza (lejos)
-     * - IPD > 200px → alta confianza (cerca y nítido)
-     */
-    private fun calculateConfidence(ipdPx: Float): Int {
-        return when {
-            ipdPx < 80  -> 40
-            ipdPx < 120 -> 60
-            ipdPx < 180 -> 80
-            else        -> 95
-        }
+    fun consumePeak(): MeasurementResult? {
+        val p = lastPeakResult
+        lastPeakResult = null
+        return p
     }
 }
