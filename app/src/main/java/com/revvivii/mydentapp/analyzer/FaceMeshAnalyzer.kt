@@ -16,9 +16,36 @@ import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.sqrt
 
+/**
+ * Analizador de frames con ML Kit Face Mesh.
+ *
+ * ── FIX: aperturas grandes (>50mm) no se registraban ──────────────
+ * El óvalo solo se usa para decidir si la cara está "bien posicionada"
+ * ANTES de medir (validación de distancia/centrado). Antes, también se
+ * usaba como condición para aceptar la medición de apertura, y como el
+ * labio inferior se mueve mucho hacia abajo en aperturas grandes, salía
+ * del óvalo verticalmente y la medición se descartaba.
+ *
+ * Ahora la validación de óvalo se hace SOLO con los puntos de los OJOS
+ * (que no se mueven al abrir la boca) más el labio SUPERIOR (que apenas
+ * se mueve). El labio inferior queda libre de moverse fuera del óvalo
+ * sin invalidar la medición — así se puede medir cualquier apertura,
+ * incluso 60-70mm, mientras el rostro siga centrado.
+ *
+ * ── NUEVO FLUJO DE CAPTURA AUTOMÁTICA ──────────────────────────────
+ * En vez de un botón "Capturar pico" que el usuario presiona mientras
+ * mira la pantalla, ahora el flujo es:
+ *   1. El usuario presiona "Iniciar medición" → startMeasuring()
+ *   2. El analizador sigue el valor de apertura frame a frame
+ *   3. Cuando detecta que la apertura SUBIÓ y luego empezó a BAJAR
+ *      de forma sostenida, asume que el pico ya ocurrió y dispara
+ *      automáticamente el callback onAutoPeakDetected con el mejor
+ *      resultado registrado durante la sesión.
+ */
 class FaceMeshAnalyzer(
     private val useFrontCamera: Boolean,
-    private val onResult: (MeasurementResult) -> Unit
+    private val onResult: (MeasurementResult) -> Unit,
+    private val onAutoPeakDetected: (MeasurementResult) -> Unit = {}
 ) : ImageAnalysis.Analyzer {
 
     companion object {
@@ -31,10 +58,21 @@ class FaceMeshAnalyzer(
 
         const val AVERAGE_IPD_MM     = 63.0f
         const val MAX_TILT_PX        = 40f
-        const val PEAK_WINDOW        = 12
         const val MIN_OPEN_MM        = 8
         const val OVAL_MARGIN        = 0.20f
         const val DENTAL_OFFSET_MM   = 2
+
+        // ── Parámetros de detección automática de pico ──────────────
+        // Cuántos frames consecutivos de DESCENSO se necesitan para
+        // confirmar que el pico ya pasó (evita falsos positivos por
+        // jitter del detector en un solo frame)
+        const val FRAMES_TO_CONFIRM_DESCENT = 4
+        // Caída mínima en mm respecto al máximo para considerar que
+        // realmente está bajando (no solo ruido de ±1mm)
+        const val MIN_DROP_TO_CONFIRM_MM = 3
+        // Apertura mínima para empezar a considerar que hay un intento
+        // de medición en curso (evita disparar con la boca cerrada)
+        const val MIN_OPEN_TO_TRACK_MM = 12
     }
 
     private val detector = FaceMeshDetection.getClient(
@@ -43,10 +81,35 @@ class FaceMeshAnalyzer(
             .build()
     )
 
-    private val recentOpenings = ArrayDeque<Int>(PEAK_WINDOW)
     private val currentTrajectory = mutableListOf<Float>()
     private var lastPeakResult: MeasurementResult? = null
     private var frameCount = 0
+
+    // ── Estado de la medición automática ────────────────────────────
+    private var isMeasuring = false
+    private var bestResultSoFar: MeasurementResult? = null
+    private var bestOpeningSoFar = 0
+    private var descentFrameCount = 0
+    private var hasPeakBeenAutoCaptured = false
+
+    /** Llamar cuando el usuario presiona "Iniciar medición" */
+    fun startMeasuring() {
+        isMeasuring = true
+        hasPeakBeenAutoCaptured = false
+        bestResultSoFar = null
+        bestOpeningSoFar = 0
+        descentFrameCount = 0
+        currentTrajectory.clear()
+    }
+
+    /** Llamar al descongelar / reiniciar manualmente */
+    fun stopMeasuring() {
+        isMeasuring = false
+        bestResultSoFar = null
+        bestOpeningSoFar = 0
+        descentFrameCount = 0
+        hasPeakBeenAutoCaptured = false
+    }
 
     @androidx.camera.core.ExperimentalGetImage
     override fun analyze(imageProxy: ImageProxy) {
@@ -92,13 +155,17 @@ class FaceMeshAnalyzer(
                 val imgW = if (isRotated) imageProxy.height.toFloat() else imageProxy.width.toFloat()
                 val imgH = if (isRotated) imageProxy.width.toFloat() else imageProxy.height.toFloat()
 
-                // ── 1. Validar Óvalo ──────
+                // ── 1. Validar Óvalo ──────────────────────────────────
+                // FIX: solo se valida con OJOS + LABIO SUPERIOR.
+                // El labio inferior se excluye a propósito: en aperturas
+                // grandes baja mucho y antes salía del óvalo, descartando
+                // la medición justo cuando la boca estaba más abierta.
                 val ovalCx = imgW / 2f
                 val ovalCy = imgH * OVAL_CENTER_Y_RATIO
                 val semiA  = (imgW * OVAL_WIDTH_RATIO  / 2f) * (1f + OVAL_MARGIN)
                 val semiB  = (imgH * OVAL_HEIGHT_RATIO / 2f) * (1f + OVAL_MARGIN)
 
-                val pointsToCheck = listOfNotNull(leftEye, rightEye, upperLip, lowerLip)
+                val pointsToCheck = listOfNotNull(leftEye, rightEye, upperLip)
                 val faceInsideOval = pointsToCheck.all { p ->
                     isInsideOval(p.position.x, p.position.y, ovalCx, ovalCy, semiA, semiB)
                 }
@@ -110,7 +177,7 @@ class FaceMeshAnalyzer(
                     return@addOnSuccessListener
                 }
 
-                // ── 2. Validar Inclinación ──────
+                // ── 2. Validar Inclinación ─────────────────────────────
                 val verticalDiff = abs(leftEye.position.y - rightEye.position.y)
                 if (verticalDiff > MAX_TILT_PX) {
                     onResult(MeasurementResult(openingMm = 0, isAligned = false, alignmentMessage = "Endereza la cabeza (no la inclines)"))
@@ -118,7 +185,7 @@ class FaceMeshAnalyzer(
                     return@addOnSuccessListener
                 }
 
-                // ── 3. Escala IPD ──────
+                // ── 3. Escala IPD ───────────────────────────────────────
                 val ipdPx = distance2D(leftEye, rightEye)
                 if (ipdPx < 20f) {
                     imageProxy.close()
@@ -126,7 +193,9 @@ class FaceMeshAnalyzer(
                 }
                 val mmPerPx = AVERAGE_IPD_MM / ipdPx
 
-                // ── 4. Apertura ──────
+                // ── 4. Apertura ──────────────────────────────────────────
+                // Sin límite superior artificial — cualquier distancia que
+                // ML Kit detecte entre los puntos 13 y 14 se convierte a mm.
                 val openingPx = distance2D(upperLip, lowerLip)
                 val baseOpeningMm = (openingPx * mmPerPx).toInt()
                 val openingMm = if (baseOpeningMm > MIN_OPEN_MM) baseOpeningMm + DENTAL_OFFSET_MM else baseOpeningMm
@@ -137,7 +206,7 @@ class FaceMeshAnalyzer(
                     else -> 98
                 }
 
-                // ── 5. Desviación Horizontal ──────
+                // ── 5. Desviación Horizontal ────────────────────────────
                 val faceCenterX = (leftEye.position.x + rightEye.position.x) / 2f
                 val mouthCenterX = if (leftMouth != null && rightMouth != null)
                     (leftMouth.position.x + rightMouth.position.x) / 2f
@@ -154,7 +223,7 @@ class FaceMeshAnalyzer(
                     else -> "Izquierda"
                 }
 
-                // ── 6. Trayectoria ──────
+                // ── 6. Trayectoria (para patrón C/S/Deflexión) ──────────
                 if (baseOpeningMm > MIN_OPEN_MM) {
                     currentTrajectory.add(deviationMm)
                 } else {
@@ -187,14 +256,47 @@ class FaceMeshAnalyzer(
                     detectedPattern     = currentPattern
                 )
 
-                // ── 7. Pico Máximo ──────
-                if (openingMm >= MIN_OPEN_MM) {
-                    if (recentOpenings.size >= PEAK_WINDOW) recentOpenings.removeFirst()
-                    recentOpenings.addLast(openingMm)
+                // ── 7. Detección automática de pico máximo ─────────────
+                //
+                // Lógica: mientras isMeasuring = true, vamos guardando el
+                // mejor (mayor) resultado visto hasta ahora. En cada frame
+                // comparamos la apertura ACTUAL contra la MEJOR registrada:
+                //
+                //   - Si la apertura actual es nueva máxima → la guardamos
+                //     y reseteamos el contador de descenso (todavía subiendo)
+                //   - Si la apertura actual es menor que la mejor por al
+                //     menos MIN_DROP_TO_CONFIRM_MM → contamos un frame de
+                //     descenso. Si esto se repite FRAMES_TO_CONFIRM_DESCENT
+                //     veces seguidas, confirmamos que el pico ya pasó y
+                //     disparamos onAutoPeakDetected con el mejor resultado.
+                //
+                // Esto evita falsos positivos: un solo frame con ruido hacia
+                // abajo no dispara la captura, se necesita una tendencia
+                // sostenida de varios frames.
+                if (isMeasuring && !hasPeakBeenAutoCaptured) {
+                    if (openingMm >= MIN_OPEN_TO_TRACK_MM) {
 
-                    val peakInWindow = recentOpenings.max()
-                    if (recentOpenings.size >= 3 && openingMm == peakInWindow && openingMm > (recentOpenings.dropLast(1).maxOrNull() ?: 0)) {
-                        lastPeakResult = currentResult.copy(isPeakCapture = true)
+                        if (openingMm > bestOpeningSoFar) {
+                            // Nueva máxima — seguimos subiendo
+                            bestOpeningSoFar = openingMm
+                            bestResultSoFar  = currentResult.copy(isPeakCapture = true)
+                            descentFrameCount = 0
+
+                        } else if (bestOpeningSoFar - openingMm >= MIN_DROP_TO_CONFIRM_MM) {
+                            // La apertura bajó de forma significativa respecto al máximo
+                            descentFrameCount++
+
+                            if (descentFrameCount >= FRAMES_TO_CONFIRM_DESCENT) {
+                                // Confirmado: el pico ya pasó. Disparamos la captura
+                                // automática con el MEJOR resultado registrado (no el actual,
+                                // que ya está bajando)
+                                hasPeakBeenAutoCaptured = true
+                                bestResultSoFar?.let { onAutoPeakDetected(it) }
+                            }
+                        } else {
+                            // Fluctuación pequeña (ruido), no cuenta como descenso real
+                            descentFrameCount = 0
+                        }
                     }
                 }
 
@@ -231,7 +333,6 @@ class FaceMeshAnalyzer(
     }
 
     private fun resetTrajectory() {
-        recentOpenings.clear()
         currentTrajectory.clear()
         lastPeakResult = null
     }
@@ -244,6 +345,7 @@ class FaceMeshAnalyzer(
         return sqrt((a.position.x - b.position.x).pow(2) + (a.position.y - b.position.y).pow(2))
     }
 
+    /** Mantenido por compatibilidad si se quiere capturar manualmente */
     fun consumePeak(): MeasurementResult? {
         val p = lastPeakResult
         lastPeakResult = null

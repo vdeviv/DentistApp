@@ -44,6 +44,8 @@ fun CameraScreen(hasCameraPermission: Boolean) {
     var liveResult     by remember { mutableStateOf<MeasurementResult?>(null) }
     var frozenResult   by remember { mutableStateOf<MeasurementResult?>(null) }
     var useFrontCamera by remember { mutableStateOf(true) }
+    // true mientras estamos en sesión de medición activa, esperando el pico
+    var isMeasuring    by remember { mutableStateOf(false) }
     val analyzerRef    = remember { mutableStateOf<FaceMeshAnalyzer?>(null) }
 
     val isFrozen = frozenResult != null
@@ -53,7 +55,13 @@ fun CameraScreen(hasCameraPermission: Boolean) {
             CameraPreviewWithAnalysis(
                 useFrontCamera      = useFrontCamera,
                 onMeasurementUpdate = { liveResult = it },
-                onAnalyzerReady     = { analyzerRef.value = it }
+                onAnalyzerReady     = { analyzerRef.value = it },
+                // Se dispara automáticamente cuando el analizador detecta
+                // que la apertura alcanzó su máximo y empezó a bajar
+                onAutoPeakDetected  = { peak ->
+                    frozenResult = peak
+                    isMeasuring  = false
+                }
             )
 
             FaceGuideOverlay(
@@ -67,9 +75,15 @@ fun CameraScreen(hasCameraPermission: Boolean) {
                 onFlipCamera   = {
                     frozenResult   = null
                     liveResult     = null
+                    isMeasuring    = false
+                    analyzerRef.value?.stopMeasuring()
                     useFrontCamera = !useFrontCamera
                 },
-                onUnfreeze = { frozenResult = null }
+                onUnfreeze = {
+                    frozenResult = null
+                    isMeasuring  = false
+                    analyzerRef.value?.stopMeasuring()
+                }
             )
 
             Box(modifier = Modifier.align(Alignment.BottomCenter)) {
@@ -77,9 +91,11 @@ fun CameraScreen(hasCameraPermission: Boolean) {
                     FrozenMetricsPanel(result = frozenResult!!)
                 } else {
                     LivePanel(
-                        result        = liveResult,
-                        onCapturePeak = {
-                            analyzerRef.value?.consumePeak()?.let { frozenResult = it }
+                        result      = liveResult,
+                        isMeasuring = isMeasuring,
+                        onStartMeasuring = {
+                            isMeasuring = true
+                            analyzerRef.value?.startMeasuring()
                         }
                     )
                 }
@@ -94,13 +110,15 @@ fun CameraScreen(hasCameraPermission: Boolean) {
 fun CameraPreviewWithAnalysis(
     useFrontCamera: Boolean,
     onMeasurementUpdate: (MeasurementResult) -> Unit,
-    onAnalyzerReady: (FaceMeshAnalyzer) -> Unit
+    onAnalyzerReady: (FaceMeshAnalyzer) -> Unit,
+    onAutoPeakDetected: (MeasurementResult) -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
     val analyzer = remember(useFrontCamera) {
-        FaceMeshAnalyzer(useFrontCamera, onMeasurementUpdate).also { onAnalyzerReady(it) }
+        FaceMeshAnalyzer(useFrontCamera, onMeasurementUpdate, onAutoPeakDetected)
+            .also { onAnalyzerReady(it) }
     }
 
     key(useFrontCamera) {
@@ -413,7 +431,11 @@ fun TrajectoryGraph(history: List<Float>) {
 }
 
 @Composable
-fun LivePanel(result: MeasurementResult?, onCapturePeak: () -> Unit) {
+fun LivePanel(
+    result: MeasurementResult?,
+    isMeasuring: Boolean,
+    onStartMeasuring: () -> Unit
+) {
     Box(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -430,15 +452,54 @@ fun LivePanel(result: MeasurementResult?, onCapturePeak: () -> Unit) {
                         Text("⚠️ ${result.alignmentMessage}", color = Color(0xFFFF6B35), fontSize = 15.sp, textAlign = TextAlign.Center)
                     }
                     else -> {
-                        Text("Apertura Funcional Activa", color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp)
+                        Text(
+                            if (isMeasuring) "Apertura en curso..." else "Apertura Funcional Activa",
+                            color = Color.White.copy(alpha = 0.6f),
+                            fontSize = 12.sp
+                        )
                         Text("${result.openingMm} mm", color = Color.White, fontSize = 38.sp, fontWeight = FontWeight.Bold)
 
                         val (label, labelColor) = clinicalRange(result.openingMm)
                         Text(label, color = labelColor, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
 
                         Spacer(Modifier.height(10.dp))
-                        Button(onClick = onCapturePeak, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00695C))) {
-                            Text("⚡ Congelar Pico Máximo", fontSize = 14.sp)
+
+                        if (isMeasuring) {
+                            // Indicador de que la app está vigilando la apertura
+                            // esperando el momento del pico — no hay botón que
+                            // presionar, la captura es automática
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                CircularProgressIndicator(
+                                    modifier    = Modifier.size(16.dp),
+                                    color       = Color(0xFF00E676),
+                                    strokeWidth = 2.dp
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    "Abre al máximo, se congelará solo",
+                                    color    = Color.White.copy(alpha = 0.7f),
+                                    fontSize = 12.sp
+                                )
+                            }
+                        } else {
+                            Button(
+                                onClick  = onStartMeasuring,
+                                modifier = Modifier.fillMaxWidth(),
+                                colors   = ButtonDefaults.buttonColors(containerColor = Color(0xFF00695C))
+                            ) {
+                                Text("▶ Iniciar medición", fontSize = 14.sp)
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                "Presiona y luego abre la boca al máximo",
+                                color     = Color.White.copy(alpha = 0.4f),
+                                fontSize  = 11.sp,
+                                textAlign = TextAlign.Center
+                            )
                         }
                     }
                 }
