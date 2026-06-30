@@ -39,5 +39,6 @@ data class MeasurementResult(
     val confidence: Int = 0,
     val isPeakCapture: Boolean = false,
     val trajectoryHistory: List<Float> = emptyList(),
-    val detectedPattern: OpeningPattern = OpeningPattern.RECTILINEO
+    val detectedPattern: OpeningPattern = OpeningPattern.RECTILINEO,
+    val faceMeshPoints: List<Offset> = emptyList()
 )

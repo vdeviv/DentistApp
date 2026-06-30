@@ -35,9 +35,13 @@ import com.revvivii.mydentapp.model.MeasurementResult
 import com.revvivii.mydentapp.model.OpeningPattern
 import kotlin.math.abs
 
-const val OVAL_WIDTH_RATIO = 0.68f
-const val OVAL_HEIGHT_RATIO = 0.58f
-const val OVAL_CENTER_Y_RATIO = 1f / 2.4f
+// ════════════════════════════════════════════════════════════════════
+// NOTA: El óvalo rígido (OVAL_WIDTH_RATIO, OVAL_HEIGHT_RATIO, etc.) fue
+// ELIMINADO de la interfaz. Ya no se dibuja ningún elemento de encuadre
+// fijo. La validación de posición ahora ocurre exclusivamente dentro de
+// FaceMeshAnalyzer mediante la "Zona de Éxito Virtual" (distancia IPD +
+// alineación roll/yaw + estabilidad sostenida de 1s).
+// ════════════════════════════════════════════════════════════════════
 
 @Composable
 fun CameraScreen(hasCameraPermission: Boolean) {
@@ -56,14 +60,14 @@ fun CameraScreen(hasCameraPermission: Boolean) {
                 useFrontCamera      = useFrontCamera,
                 onMeasurementUpdate = { liveResult = it },
                 onAnalyzerReady     = { analyzerRef.value = it },
-                // Se dispara automáticamente cuando el analizador detecta
-                // que la apertura alcanzó su máximo y empezó a bajar
                 onAutoPeakDetected  = { peak ->
                     frozenResult = peak
                     isMeasuring  = false
                 }
             )
 
+            // Overlay SIN óvalo: solo puntos anatómicos + líneas cuando
+            // hay un resultado alineado (en vivo o congelado)
             FaceGuideOverlay(
                 result   = if (isFrozen) frozenResult else liveResult,
                 isFrozen = isFrozen
@@ -158,46 +162,16 @@ fun CameraPreviewWithAnalysis(
     }
 }
 
+// ────────────────────────────────────────────────────────────────────
+// OVERLAY: ya NO dibuja óvalo. Solo puntos anatómicos y líneas de
+// medición/desviación cuando hay un rostro válido (alineado o congelado)
+// ────────────────────────────────────────────────────────────────────
+
 @Composable
 fun FaceGuideOverlay(result: MeasurementResult?, isFrozen: Boolean) {
     Canvas(modifier = Modifier.fillMaxSize()) {
         val W = size.width
         val H = size.height
-
-        val ovalW = W * OVAL_WIDTH_RATIO
-        val ovalH = H * OVAL_HEIGHT_RATIO
-        val cx    = W / 2f
-        val cy    = H * OVAL_CENTER_Y_RATIO
-
-        val ovalColor = when {
-            isFrozen             -> Color(0xFFFFD700)
-            result == null       -> Color(0xFFFFD700)
-            result.isAligned     -> Color(0xFF00E676)
-            else                 -> Color(0xFFFF6B35)
-        }
-
-        // ── 1. Óvalo Guía Estático ──────
-        drawOval(
-            color   = ovalColor,
-            topLeft = Offset(cx - ovalW / 2f, cy - ovalH / 2f),
-            size    = Size(ovalW, ovalH),
-            style   = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
-        )
-
-        // Caja de Enfoque Predictiva para la Boca (Solo en vivo si no está alineado)
-        val mouthBoxY = cy + (ovalH / 4f)
-        val mouthBoxW = ovalW * 0.55f
-        val mouthBoxH = 55.dp.toPx()
-
-        if (!isFrozen && (result == null || !result.isAligned)) {
-            drawRoundRect(
-                color = Color.White.copy(alpha = 0.35f),
-                topLeft = Offset(cx - mouthBoxW / 2f, mouthBoxY - mouthBoxH / 2f),
-                size = Size(mouthBoxW, mouthBoxH),
-                style = Stroke(width = 1.5.dp.toPx(), pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f))),
-                cornerRadius = CornerRadius(8.dp.toPx())
-            )
-        }
 
         val r = result ?: return@Canvas
         if (!r.isAligned) return@Canvas
@@ -210,7 +184,9 @@ fun FaceGuideOverlay(result: MeasurementResult?, isFrozen: Boolean) {
 
         val accColor = if (isFrozen) Color(0xFFFFD700) else Color(0xFF00E676)
 
-        // ── 2. Puntos anatómicos discretos (Siempre visibles para feedback) ──────
+
+
+        // ── Puntos anatómicos discretos (siempre visibles si hay cara) ─
         drawCircle(color = accColor, radius = 4.dp.toPx(), center = upper)
         drawCircle(color = accColor, radius = 4.dp.toPx(), center = lower)
         if (left != null && right != null) {
@@ -218,9 +194,9 @@ fun FaceGuideOverlay(result: MeasurementResult?, isFrozen: Boolean) {
             drawCircle(color = Color(0xFF29B6F6), radius = 3.5.dp.toPx(), center = right)
         }
 
-        // ── 3. DETALLES DIAGNÓSTICOS CONGELADOS (SOLO APARECEN AL CAPTURAR) ──
+        // ── Detalles diagnósticos completos: solo al congelar ──────────
         if (isFrozen) {
-            // Línea vertical que muestra la apertura medida entre incisivos
+            // Línea vertical que muestra la apertura medida entre labios
             drawLine(
                 color       = accColor,
                 start       = upper,
@@ -238,19 +214,18 @@ fun FaceGuideOverlay(result: MeasurementResult?, isFrozen: Boolean) {
                     strokeWidth = 2.dp.toPx()
                 )
 
-                // EJE CRANEAL DE DESVIACIÓN MANDIBULAR (Súper estable, fijo y nítido)
+                // Eje de desviación mandibular: línea vertical sobre el
+                // punto medio de las comisuras
                 val facialCenterX = (left.x + right.x) / 2f
-                val lineTop   = upper.y - 60.dp.toPx()
-                val lineBot   = upper.y + 80.dp.toPx()
+                val lineTop = upper.y - 60.dp.toPx()
+                val lineBot = upper.y + 80.dp.toPx()
 
-                // Sombra de contraste posterior
                 drawLine(
                     color       = Color.Black.copy(alpha = 0.5f),
                     start       = Offset(facialCenterX + 1f, lineTop),
                     end         = Offset(facialCenterX + 1f, lineBot),
                     strokeWidth = 4.dp.toPx()
                 )
-                // Línea de desviación central
                 drawLine(
                     color       = Color(0xFFFF7043),
                     start       = Offset(facialCenterX, lineTop),
@@ -263,7 +238,6 @@ fun FaceGuideOverlay(result: MeasurementResult?, isFrozen: Boolean) {
                 drawLine(color = Color(0xFFFF7043), start = Offset(facialCenterX - tickLen, lineBot), end = Offset(facialCenterX + tickLen, lineBot), strokeWidth = 2.dp.toPx())
             }
 
-            // Marco decorativo de pantalla capturada
             drawRect(color = Color(0xFFFFD700).copy(alpha = 0.3f), size = this.size, style = Stroke(width = 6.dp.toPx()))
         }
     }
@@ -353,7 +327,7 @@ fun FrozenMetricsPanel(result: MeasurementResult, modifier: Modifier = Modifier)
                 Text("Patrón Clínico Detectado:", color = Color.White.copy(alpha = 0.6f), fontSize = 11.sp)
                 Text(
                     text = result.detectedPattern.description,
-                    color = when(result.detectedPattern) {
+                    color = when (result.detectedPattern) {
                         OpeningPattern.RECTILINEO -> Color(0xFF00E676)
                         else -> Color(0xFFFF7043)
                     },
@@ -430,6 +404,8 @@ fun TrajectoryGraph(history: List<Float>) {
     }
 }
 
+
+
 @Composable
 fun LivePanel(
     result: MeasurementResult?,
@@ -445,10 +421,12 @@ fun LivePanel(
             Column(modifier = Modifier.fillMaxWidth().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 when {
                     result == null -> {
-                        Text("🔍 Centra el rostro en la guía", color = Color(0xFFFFD700), fontSize = 15.sp)
+                        Text("🔍 Apunta la cámara hacia el rostro", color = Color(0xFFFFD700), fontSize = 15.sp, textAlign = TextAlign.Center)
                         Text("Buscando puntos de control...", color = Color.White.copy(alpha = 0.4f), fontSize = 12.sp)
                     }
                     !result.isAligned -> {
+                        // Aquí se muestran los mensajes de la Zona de Éxito:
+                        // distancia, alineación o "Mantén la posición... (0.7s)"
                         Text("⚠️ ${result.alignmentMessage}", color = Color(0xFFFF6B35), fontSize = 15.sp, textAlign = TextAlign.Center)
                     }
                     else -> {
@@ -465,9 +443,6 @@ fun LivePanel(
                         Spacer(Modifier.height(10.dp))
 
                         if (isMeasuring) {
-                            // Indicador de que la app está vigilando la apertura
-                            // esperando el momento del pico — no hay botón que
-                            // presionar, la captura es automática
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.Center,
@@ -540,20 +515,57 @@ fun DeviationBar(deviationMm: Float) {
 }
 
 @Composable
-fun MetricBox(label: String, value: String, sub: String, color: Color) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Text(label, color = Color.White.copy(alpha = 0.5f), fontSize = 10.sp)
-        Text(value, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        Text(sub,   color = color,       fontSize = 11.sp, fontWeight = FontWeight.Medium)
+fun MetricBox(
+    title: String,
+    value: String,
+    subtitle: String,
+    color: Color
+) {
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.widthIn(min = 90.dp)
+    ) {
+
+        Text(
+            text = title,
+            color = Color.White.copy(alpha = 0.55f),
+            fontSize = 10.sp
+        )
+
+        Spacer(Modifier.height(2.dp))
+
+        Text(
+            text = value,
+            color = Color.White,
+            fontSize = 21.sp,
+            fontWeight = FontWeight.Bold
+        )
+
+        Spacer(Modifier.height(2.dp))
+
+        Text(
+            text = subtitle,
+            color = color,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold
+        )
     }
 }
 
-fun clinicalRange(mm: Int): Pair<String, Color> = when {
-    mm >= 35 -> "Normal"           to Color(0xFF00E676)
-    mm >= 25 -> "Limitación Leve"  to Color(0xFFFFD700)
-    mm >= 15 -> "Lim. Moderada"    to Color(0xFFFF9800)
-    else     -> "Lim. Severa"      to Color(0xFFFF5252)
-}
+fun clinicalRange(openingMm: Int): Pair<String, Color> =
+    when {
+
+        openingMm < 35 ->
+            "Restringido" to Color(0xFFE53935)
+
+        openingMm in 35..40 ->
+            "Límite" to Color(0xFFFF9800)
+
+        else ->
+            "Normal" to Color(0xFF00E676)
+    }
+
 
 @Composable
 fun NoPermissionScreen() {
@@ -561,3 +573,4 @@ fun NoPermissionScreen() {
         Text("Permiso de cámara requerido.", color = Color.White, fontSize = 16.sp)
     }
 }
+

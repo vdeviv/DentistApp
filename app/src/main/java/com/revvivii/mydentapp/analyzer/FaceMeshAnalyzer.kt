@@ -4,14 +4,12 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.compose.ui.geometry.Offset
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.facemesh.FaceMesh
 import com.google.mlkit.vision.facemesh.FaceMeshDetection
 import com.google.mlkit.vision.facemesh.FaceMeshDetectorOptions
 import com.google.mlkit.vision.facemesh.FaceMeshPoint
 import com.revvivii.mydentapp.model.MeasurementResult
 import com.revvivii.mydentapp.model.OpeningPattern
-import com.revvivii.mydentapp.ui.OVAL_CENTER_Y_RATIO
-import com.revvivii.mydentapp.ui.OVAL_HEIGHT_RATIO
-import com.revvivii.mydentapp.ui.OVAL_WIDTH_RATIO
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.sqrt
@@ -19,28 +17,66 @@ import kotlin.math.sqrt
 /**
  * Analizador de frames con ML Kit Face Mesh.
  *
- * ── FIX: aperturas grandes (>50mm) no se registraban ──────────────
- * El óvalo solo se usa para decidir si la cara está "bien posicionada"
- * ANTES de medir (validación de distancia/centrado). Antes, también se
- * usaba como condición para aceptar la medición de apertura, y como el
- * labio inferior se mueve mucho hacia abajo en aperturas grandes, salía
- * del óvalo verticalmente y la medición se descartaba.
+ * ════════════════════════════════════════════════════════════════════
+ * CAMBIO DE ARQUITECTURA: Óvalo manual → Zona de Éxito Virtual
+ * ════════════════════════════════════════════════════════════════════
  *
- * Ahora la validación de óvalo se hace SOLO con los puntos de los OJOS
- * (que no se mueven al abrir la boca) más el labio SUPERIOR (que apenas
- * se mueve). El labio inferior queda libre de moverse fuera del óvalo
- * sin invalidar la medición — así se puede medir cualquier apertura,
- * incluso 60-70mm, mientras el rostro siga centrado.
+ * ANTES: Se dibujaba un óvalo fijo en pantalla y se comprobaba si los
+ * puntos del rostro caían dentro de esa elipse. Esto obligaba al dentista
+ * a encuadrar manualmente y dependía de la resolución/aspect ratio de
+ * cada teléfono, generando inconsistencia.
  *
- * ── NUEVO FLUJO DE CAPTURA AUTOMÁTICA ──────────────────────────────
- * En vez de un botón "Capturar pico" que el usuario presiona mientras
- * mira la pantalla, ahora el flujo es:
- *   1. El usuario presiona "Iniciar medición" → startMeasuring()
- *   2. El analizador sigue el valor de apertura frame a frame
- *   3. Cuando detecta que la apertura SUBIÓ y luego empezó a BAJAR
- *      de forma sostenida, asume que el pico ya ocurrió y dispara
- *      automáticamente el callback onAutoPeakDetected con el mejor
- *      resultado registrado durante la sesión.
+ * AHORA: No hay ningún elemento visual de encuadre. La validación es
+ * puramente matemática sobre la geometría del Face Mesh, sin importar
+ * dónde esté la cara en la pantalla:
+ *
+ *   1. ALINEACIÓN (roll/yaw aproximados):
+ *      - Roll (inclinación lateral de cabeza) → diferencia de altura Y
+ *        entre los dos ojos. Cabeza derecha = diferencia ≈ 0.
+ *      - Yaw (giro de cabeza izq/der) → comparamos la distancia de cada
+ *        ojo a la punta de la nariz. Si el rostro está de frente, ambas
+ *        distancias son similares; si gira, una se acorta y otra se
+ *        alarga.
+ *
+ *   2. DISTANCIA ÓPTIMA (proxy de "ni muy cerca ni muy lejos"):
+ *      - Se mide el IPD en píxeles (distancia entre comisuras oculares).
+ *      - Debe caer dentro de un rango umbral fijo, p.ej. [150, 250] px.
+ *        Este rango se calibra para que corresponda a una distancia real
+ *        cómoda de exploración clínica (~25-40cm aprox, depende del FOV
+ *        de la cámara del dispositivo).
+ *
+ *   3. ESTABILIDAD SOSTENIDA (1 segundo):
+ *      - No basta con que UN frame cumpla las condiciones. Se exige que
+ *        la "Zona de Éxito" se mantenga cumplida de forma CONTINUA
+ *        durante STABILITY_WINDOW_MS milisegundos antes de empezar a
+ *        considerar la medición válida. Esto evita capturas accidentales
+ *        por un parpadeo de detección.
+ *
+ * ════════════════════════════════════════════════════════════════════
+ * NORMALIZACIÓN DE ESCALA (IPD como regla absoluta)
+ * ════════════════════════════════════════════════════════════════════
+ *
+ * NOTA IMPORTANTE sobre la fórmula pedida originalmente
+ * (factor_escala = distancia_ojos_base / distancia_ojos_abierta):
+ *
+ * Esa fórmula compara el IPD en dos instantes distintos (boca cerrada
+ * vs boca abierta). Pero el IPD NO cambia por abrir la boca — solo
+ * cambia si el teléfono se aleja o acerca físicamente. Si el dentista
+ * sostiene el teléfono fijo durante toda la prueba (que es el flujo
+ * normal), ese cociente es ≈ 1.0 siempre y no corrige nada.
+ *
+ * La forma correcta de "neutralizar" el movimiento del teléfono es usar
+ * el IPD como regla de calibración EN CADA FRAME INDIVIDUAL (no como
+ * cociente entre dos tomas):
+ *
+ *     mm_por_px  = IPD_PROMEDIO_MM / IPD_medido_en_ESTE_frame_px
+ *     apertura_mm = apertura_px(labio_sup, labio_inf) × mm_por_px
+ *
+ * Esto sí compensa automáticamente la distancia: si el teléfono se aleja,
+ * el IPD_px baja, mm_por_px sube, y la apertura en mm se mantiene estable
+ * aunque la apertura en píxeles haya disminuido por la distancia.
+ * Esta es la lógica que ya implementábamos y la mantenemos aquí, ahora
+ * sin depender de ningún óvalo dibujado.
  */
 class FaceMeshAnalyzer(
     private val useFrontCamera: Boolean,
@@ -49,29 +85,45 @@ class FaceMeshAnalyzer(
 ) : ImageAnalysis.Analyzer {
 
     companion object {
+        // ── Landmarks del Face Mesh (468 puntos, índices MediaPipe) ──
         const val UPPER_LIP_CENTER   = 13
         const val LOWER_LIP_CENTER   = 14
         const val LEFT_EYE_CORNER    = 33
         const val RIGHT_EYE_CORNER   = 263
         const val LEFT_MOUTH_CORNER  = 61
         const val RIGHT_MOUTH_CORNER = 291
+        const val NOSE_TIP           = 1     // punta de nariz, para estimar yaw
 
+        // ── Calibración de escala ──────────────────────────────────
         const val AVERAGE_IPD_MM     = 63.0f
-        const val MAX_TILT_PX        = 40f
-        const val MIN_OPEN_MM        = 8
-        const val OVAL_MARGIN        = 0.20f
-        const val DENTAL_OFFSET_MM   = 2
+        const val DENTAL_OFFSET_MM   = 2     // compensa grosor de labios
 
-        // ── Parámetros de detección automática de pico ──────────────
-        // Cuántos frames consecutivos de DESCENSO se necesitan para
-        // confirmar que el pico ya pasó (evita falsos positivos por
-        // jitter del detector en un solo frame)
+        // ── Zona de Éxito Virtual: distancia óptima ─────────────────
+        // Rango de IPD en píxeles considerado "distancia correcta".
+        // Si IPD_px < MIN → cara muy lejos (poca resolución, impreciso)
+        // Si IPD_px > MAX → cara muy cerca (riesgo de distorsión de lente)
+        const val MIN_IPD_PX = 150f
+        const val MAX_IPD_PX = 250f
+
+        // ── Zona de Éxito Virtual: alineación ───────────────────────
+        // Roll: diferencia vertical máxima entre ojos (px) para considerar
+        // la cabeza "derecha" (no inclinada lateralmente)
+        const val MAX_ROLL_PX = 25f
+        // Yaw: máxima asimetría permitida entre dist(ojoIzq,nariz) y
+        // dist(ojoDer,nariz), como fracción del promedio de ambas.
+        // 0.15 = 15% de asimetría tolerada antes de considerar que el
+        // rostro está girado y no de frente.
+        const val MAX_YAW_ASYMMETRY = 0.22f
+
+        // ── Estabilidad sostenida ───────────────────────────────────
+        // Tiempo que la Zona de Éxito debe cumplirse de forma continua
+        // antes de empezar a aceptar mediciones como válidas
+        const val STABILITY_WINDOW_MS = 1000L
+
+        // ── Detección de pico máximo (igual que antes) ──────────────
+        const val MIN_OPEN_MM = 8
         const val FRAMES_TO_CONFIRM_DESCENT = 4
-        // Caída mínima en mm respecto al máximo para considerar que
-        // realmente está bajando (no solo ruido de ±1mm)
         const val MIN_DROP_TO_CONFIRM_MM = 3
-        // Apertura mínima para empezar a considerar que hay un intento
-        // de medición en curso (evita disparar con la boca cerrada)
         const val MIN_OPEN_TO_TRACK_MM = 12
     }
 
@@ -82,10 +134,14 @@ class FaceMeshAnalyzer(
     )
 
     private val currentTrajectory = mutableListOf<Float>()
-    private var lastPeakResult: MeasurementResult? = null
     private var frameCount = 0
 
-    // ── Estado de la medición automática ────────────────────────────
+    // ── Estado de estabilidad (Zona de Éxito) ───────────────────────
+    // Marca de tiempo (ms) desde la cual la Zona de Éxito se cumple sin
+    // interrupción. null = no se está cumpliendo actualmente.
+    private var zoneEnteredAtMs: Long? = null
+
+    // ── Estado de medición automática (pico máximo) ─────────────────
     private var isMeasuring = false
     private var bestResultSoFar: MeasurementResult? = null
     private var bestOpeningSoFar = 0
@@ -109,6 +165,7 @@ class FaceMeshAnalyzer(
         bestOpeningSoFar = 0
         descentFrameCount = 0
         hasPeakBeenAutoCaptured = false
+        zoneEnteredAtMs = null
     }
 
     @androidx.camera.core.ExperimentalGetImage
@@ -129,181 +186,246 @@ class FaceMeshAnalyzer(
 
         detector.process(image)
             .addOnSuccessListener { faceMeshes ->
-                if (faceMeshes.isEmpty()) {
-                    resetTrajectory()
-                    onResult(MeasurementResult(openingMm = 0, isAligned = false, alignmentMessage = "Coloca tu rostro en el óvalo"))
-                    imageProxy.close()
-                    return@addOnSuccessListener
-                }
-
-                val mesh   = faceMeshes[0]
-                val points = mesh.allPoints
-
-                val upperLip   = points.getOrNull(UPPER_LIP_CENTER)
-                val lowerLip   = points.getOrNull(LOWER_LIP_CENTER)
-                val leftEye    = points.getOrNull(LEFT_EYE_CORNER)
-                val rightEye   = points.getOrNull(RIGHT_EYE_CORNER)
-                val leftMouth  = points.getOrNull(LEFT_MOUTH_CORNER)
-                val rightMouth = points.getOrNull(RIGHT_MOUTH_CORNER)
-
-                if (upperLip == null || lowerLip == null || leftEye == null || rightEye == null) {
-                    imageProxy.close()
-                    return@addOnSuccessListener
-                }
-
-                val isRotated = rotationDegrees == 90 || rotationDegrees == 270
-                val imgW = if (isRotated) imageProxy.height.toFloat() else imageProxy.width.toFloat()
-                val imgH = if (isRotated) imageProxy.width.toFloat() else imageProxy.height.toFloat()
-
-                // ── 1. Validar Óvalo ──────────────────────────────────
-                // FIX: solo se valida con OJOS + LABIO SUPERIOR.
-                // El labio inferior se excluye a propósito: en aperturas
-                // grandes baja mucho y antes salía del óvalo, descartando
-                // la medición justo cuando la boca estaba más abierta.
-                val ovalCx = imgW / 2f
-                val ovalCy = imgH * OVAL_CENTER_Y_RATIO
-                val semiA  = (imgW * OVAL_WIDTH_RATIO  / 2f) * (1f + OVAL_MARGIN)
-                val semiB  = (imgH * OVAL_HEIGHT_RATIO / 2f) * (1f + OVAL_MARGIN)
-
-                val pointsToCheck = listOfNotNull(leftEye, rightEye, upperLip)
-                val faceInsideOval = pointsToCheck.all { p ->
-                    isInsideOval(p.position.x, p.position.y, ovalCx, ovalCy, semiA, semiB)
-                }
-
-                if (!faceInsideOval) {
-                    resetTrajectory()
-                    onResult(MeasurementResult(openingMm = 0, isAligned = false, alignmentMessage = "Ajusta tu cara dentro del óvalo"))
-                    imageProxy.close()
-                    return@addOnSuccessListener
-                }
-
-                // ── 2. Validar Inclinación ─────────────────────────────
-                val verticalDiff = abs(leftEye.position.y - rightEye.position.y)
-                if (verticalDiff > MAX_TILT_PX) {
-                    onResult(MeasurementResult(openingMm = 0, isAligned = false, alignmentMessage = "Endereza la cabeza (no la inclines)"))
-                    imageProxy.close()
-                    return@addOnSuccessListener
-                }
-
-                // ── 3. Escala IPD ───────────────────────────────────────
-                val ipdPx = distance2D(leftEye, rightEye)
-                if (ipdPx < 20f) {
-                    imageProxy.close()
-                    return@addOnSuccessListener
-                }
-                val mmPerPx = AVERAGE_IPD_MM / ipdPx
-
-                // ── 4. Apertura ──────────────────────────────────────────
-                // Sin límite superior artificial — cualquier distancia que
-                // ML Kit detecte entre los puntos 13 y 14 se convierte a mm.
-                val openingPx = distance2D(upperLip, lowerLip)
-                val baseOpeningMm = (openingPx * mmPerPx).toInt()
-                val openingMm = if (baseOpeningMm > MIN_OPEN_MM) baseOpeningMm + DENTAL_OFFSET_MM else baseOpeningMm
-
-                val confidence = when {
-                    ipdPx < 120 -> 65
-                    ipdPx < 180 -> 85
-                    else -> 98
-                }
-
-                // ── 5. Desviación Horizontal ────────────────────────────
-                val faceCenterX = (leftEye.position.x + rightEye.position.x) / 2f
-                val mouthCenterX = if (leftMouth != null && rightMouth != null)
-                    (leftMouth.position.x + rightMouth.position.x) / 2f
-                else
-                    (upperLip.position.x + lowerLip.position.x) / 2f
-
-                val rawDeviationPx = mouthCenterX - faceCenterX
-                val correctedDeviationPx = if (useFrontCamera) rawDeviationPx * -1f else rawDeviationPx
-                val deviationMm = correctedDeviationPx * mmPerPx
-
-                val deviationDir = when {
-                    abs(deviationMm) < 1.5f -> "Centro"
-                    deviationMm > 0 -> "Derecha"
-                    else -> "Izquierda"
-                }
-
-                // ── 6. Trayectoria (para patrón C/S/Deflexión) ──────────
-                if (baseOpeningMm > MIN_OPEN_MM) {
-                    currentTrajectory.add(deviationMm)
-                } else {
-                    if (currentTrajectory.size > 3) currentTrajectory.clear()
-                }
-
-                val currentPattern = analyzePattern(currentTrajectory, deviationMm)
-
-                fun FaceMeshPoint.toNorm() = Offset(position.x / imgW, position.y / imgH)
-                val upperLipSc   = upperLip.toNorm()
-                val lowerLipSc   = lowerLip.toNorm()
-                val leftMouthSc  = leftMouth?.toNorm()
-                val rightMouthSc = rightMouth?.toNorm()
-                val midpointSc   = if (leftMouthSc != null && rightMouthSc != null)
-                    Offset((leftMouthSc.x + rightMouthSc.x) / 2f, (leftMouthSc.y + rightMouthSc.y) / 2f)
-                else null
-
-                val currentResult = MeasurementResult(
-                    openingMm           = openingMm,
-                    isAligned           = true,
-                    upperLipScreen      = upperLipSc,
-                    lowerLipScreen      = lowerLipSc,
-                    leftMouthScreen     = leftMouthSc,
-                    rightMouthScreen    = rightMouthSc,
-                    mouthMidpointScreen = midpointSc,
-                    deviationMm         = deviationMm,
-                    deviationDirection  = deviationDir,
-                    confidence          = confidence,
-                    trajectoryHistory   = ArrayList(currentTrajectory),
-                    detectedPattern     = currentPattern
-                )
-
-                // ── 7. Detección automática de pico máximo ─────────────
-                //
-                // Lógica: mientras isMeasuring = true, vamos guardando el
-                // mejor (mayor) resultado visto hasta ahora. En cada frame
-                // comparamos la apertura ACTUAL contra la MEJOR registrada:
-                //
-                //   - Si la apertura actual es nueva máxima → la guardamos
-                //     y reseteamos el contador de descenso (todavía subiendo)
-                //   - Si la apertura actual es menor que la mejor por al
-                //     menos MIN_DROP_TO_CONFIRM_MM → contamos un frame de
-                //     descenso. Si esto se repite FRAMES_TO_CONFIRM_DESCENT
-                //     veces seguidas, confirmamos que el pico ya pasó y
-                //     disparamos onAutoPeakDetected con el mejor resultado.
-                //
-                // Esto evita falsos positivos: un solo frame con ruido hacia
-                // abajo no dispara la captura, se necesita una tendencia
-                // sostenida de varios frames.
-                if (isMeasuring && !hasPeakBeenAutoCaptured) {
-                    if (openingMm >= MIN_OPEN_TO_TRACK_MM) {
-
-                        if (openingMm > bestOpeningSoFar) {
-                            // Nueva máxima — seguimos subiendo
-                            bestOpeningSoFar = openingMm
-                            bestResultSoFar  = currentResult.copy(isPeakCapture = true)
-                            descentFrameCount = 0
-
-                        } else if (bestOpeningSoFar - openingMm >= MIN_DROP_TO_CONFIRM_MM) {
-                            // La apertura bajó de forma significativa respecto al máximo
-                            descentFrameCount++
-
-                            if (descentFrameCount >= FRAMES_TO_CONFIRM_DESCENT) {
-                                // Confirmado: el pico ya pasó. Disparamos la captura
-                                // automática con el MEJOR resultado registrado (no el actual,
-                                // que ya está bajando)
-                                hasPeakBeenAutoCaptured = true
-                                bestResultSoFar?.let { onAutoPeakDetected(it) }
-                            }
-                        } else {
-                            // Fluctuación pequeña (ruido), no cuenta como descenso real
-                            descentFrameCount = 0
-                        }
-                    }
-                }
-
-                onResult(currentResult)
+                handleResult(faceMeshes, rotationDegrees, imageProxy)
                 imageProxy.close()
             }
             .addOnFailureListener { imageProxy.close() }
+    }
+
+    private fun handleResult(
+        faceMeshes: List<FaceMesh>,
+        rotationDegrees: Int,
+        imageProxy: ImageProxy
+    ) {
+        if (faceMeshes.isEmpty()) {
+            zoneEnteredAtMs = null
+            resetTrajectory()
+            onResult(
+                MeasurementResult(
+                    openingMm = 0, isAligned = false,
+                    alignmentMessage = "Apunta la cámara hacia el rostro"
+                )
+            )
+            return
+        }
+
+        val mesh   = faceMeshes[0]
+        val points = mesh.allPoints
+
+        val upperLip   = points.getOrNull(UPPER_LIP_CENTER)
+        val lowerLip   = points.getOrNull(LOWER_LIP_CENTER)
+        val leftEye    = points.getOrNull(LEFT_EYE_CORNER)
+        val rightEye   = points.getOrNull(RIGHT_EYE_CORNER)
+        val leftMouth  = points.getOrNull(LEFT_MOUTH_CORNER)
+        val rightMouth = points.getOrNull(RIGHT_MOUTH_CORNER)
+        val noseTip    = points.getOrNull(NOSE_TIP)
+
+        if (upperLip == null || lowerLip == null || leftEye == null || rightEye == null) {
+            return
+        }
+
+        // ════════════════════════════════════════════════════════════
+        // 1. ZONA DE ÉXITO VIRTUAL — validación matemática sin overlay
+        // ════════════════════════════════════════════════════════════
+
+        val ipdPx = distance2D(leftEye, rightEye)
+
+        // ── 1a. Distancia óptima ────────────────────────────────────
+        val distanceOk = ipdPx in MIN_IPD_PX..MAX_IPD_PX
+
+        // ── 1b. Roll (inclinación lateral) ──────────────────────────
+        val rollPx = abs(leftEye.position.y - rightEye.position.y)
+        val rollOk = rollPx <= MAX_ROLL_PX
+
+        // ── 1c. Yaw (giro de cabeza) ─────────────────────────────────
+        // Si no tenemos punta de nariz, omitimos esta validación (no
+        // bloqueamos la medición solo por falta de un punto opcional)
+        val yawOk = if (noseTip != null) {
+
+            val distLeftToNose = distance2D(leftEye, noseTip)
+            val distRightToNose = distance2D(rightEye, noseTip)
+
+            // Normalización usando la distancia interpupilar
+            val asymmetry = abs(distLeftToNose - distRightToNose) / ipdPx
+
+            asymmetry <= MAX_YAW_ASYMMETRY
+
+        } else {
+            true
+        }
+
+        val zoneOk = distanceOk && rollOk && yawOk
+
+        // ── 1d. Mensaje específico de guía cuando algo falla ────────
+        val guidanceMessage = when {
+            !distanceOk && ipdPx < MIN_IPD_PX -> "Acerca el teléfono al rostro"
+            !distanceOk && ipdPx > MAX_IPD_PX -> "Aleja un poco el teléfono"
+            !rollOk -> "Endereza la cabeza (no la inclines)"
+            !yawOk  -> "Gira el rostro para mirar de frente"
+            else -> ""
+        }
+
+        // ════════════════════════════════════════════════════════════
+        // 2. ESTABILIDAD SOSTENIDA — debe cumplirse 1s sin interrupción
+        // ════════════════════════════════════════════════════════════
+
+        val now = System.currentTimeMillis()
+
+        if (!zoneOk) {
+            // Cualquier condición que falle reinicia el contador de estabilidad
+            zoneEnteredAtMs = null
+            onResult(
+                MeasurementResult(
+                    openingMm = 0, isAligned = false,
+                    alignmentMessage = guidanceMessage
+                )
+            )
+            return
+        }
+
+        // La zona se cumple en este frame. Si es la primera vez, marcamos
+        // el instante de entrada. Si ya estaba marcado, comprobamos cuánto
+        // tiempo lleva sostenida.
+        if (zoneEnteredAtMs == null) {
+            zoneEnteredAtMs = now
+        }
+        val stableForMs = now - (zoneEnteredAtMs ?: now)
+        val isStable = stableForMs >= STABILITY_WINDOW_MS
+
+        if (!isStable) {
+            // Aún cumpliendo, pero no ha pasado 1 segundo todavía
+            val remainingMs =
+                (STABILITY_WINDOW_MS - stableForMs)
+                    .coerceAtLeast(0L)
+
+            val remainingText =
+                String.format("%.1f", remainingMs / 1000.0f)
+
+            onResult(
+                MeasurementResult(
+                    openingMm = 0,
+                    isAligned = false,
+                    alignmentMessage = "Mantén la posición... ($remainingText s)"
+                )
+            )
+            return
+        }
+
+        // ════════════════════════════════════════════════════════════
+        // 3. MEDICIÓN — la Zona de Éxito lleva ≥1s estable, medimos
+        // ════════════════════════════════════════════════════════════
+
+        val isRotated = rotationDegrees == 90 || rotationDegrees == 270
+        val imgW = if (isRotated) imageProxy.height.toFloat() else imageProxy.width.toFloat()
+        val imgH = if (isRotated) imageProxy.width.toFloat() else imageProxy.height.toFloat()
+
+        // ── 3a. Escala mm/px usando IPD como regla absoluta ─────────
+        // Esto es lo que neutraliza el efecto de que el teléfono esté
+        // más cerca o más lejos: cada frame se autocalibra con su propio
+        // IPD, sin depender de una toma de referencia anterior.
+        val mmPerPx = AVERAGE_IPD_MM / ipdPx
+
+        // ── 3b. Apertura bucal ───────────────────────────────────────
+        val openingPx = distance2D(upperLip, lowerLip)
+        val baseOpeningMm = (openingPx * mmPerPx).toInt()
+        val openingMm = if (baseOpeningMm > MIN_OPEN_MM) baseOpeningMm + DENTAL_OFFSET_MM else baseOpeningMm
+
+        // Confianza: ahora basada en qué tan centrado está el IPD dentro
+        // del rango óptimo [MIN_IPD_PX, MAX_IPD_PX] — el centro del rango
+        // da la mayor confianza
+        val rangeCenter = (MIN_IPD_PX + MAX_IPD_PX) / 2f
+        val rangeHalfWidth = (MAX_IPD_PX - MIN_IPD_PX) / 2f
+        val distanceFromCenter = abs(ipdPx - rangeCenter) / rangeHalfWidth
+        val confidence = (98 - (distanceFromCenter * 25)).toInt().coerceIn(65, 98)
+
+        // ── 3c. Desviación mandibular ────────────────────────────────
+        val faceCenterX = (leftEye.position.x + rightEye.position.x) / 2f
+        val mouthCenterX = if (leftMouth != null && rightMouth != null)
+            (leftMouth.position.x + rightMouth.position.x) / 2f
+        else
+            (upperLip.position.x + lowerLip.position.x) / 2f
+
+        val rawDeviationPx = mouthCenterX - faceCenterX
+        val correctedDeviationPx = if (useFrontCamera) rawDeviationPx * -1f else rawDeviationPx
+        val deviationMm = correctedDeviationPx * mmPerPx
+
+        val deviationDir = when {
+            abs(deviationMm) < 1.5f -> "Centro"
+            deviationMm > 0 -> "Derecha"
+            else -> "Izquierda"
+        }
+
+        // ── 3d. Trayectoria de desviación (para patrón C/S/Deflexión) ─
+        if (baseOpeningMm > MIN_OPEN_MM) {
+            currentTrajectory.add(deviationMm)
+        } else if (currentTrajectory.size > 3) {
+            currentTrajectory.clear()
+        }
+        val currentPattern = analyzePattern(currentTrajectory, deviationMm)
+
+        // ── 3e. Coordenadas normalizadas [0..1] para overlay ─────────
+        fun FaceMeshPoint.toNorm() = Offset(position.x / imgW, position.y / imgH)
+        val upperLipSc   = upperLip.toNorm()
+        val lowerLipSc   = lowerLip.toNorm()
+        val leftMouthSc  = leftMouth?.toNorm()
+        val rightMouthSc = rightMouth?.toNorm()
+        val midpointSc   = if (leftMouthSc != null && rightMouthSc != null)
+            Offset((leftMouthSc.x + rightMouthSc.x) / 2f, (leftMouthSc.y + rightMouthSc.y) / 2f)
+        else null
+
+        val meshPoints = points.map {
+            Offset(
+                it.position.x / imgW,
+                it.position.y / imgH
+            )
+        }
+
+        val currentResult = MeasurementResult(
+            openingMm           = openingMm,
+            isAligned           = true,
+            upperLipScreen      = upperLipSc,
+            lowerLipScreen      = lowerLipSc,
+            leftMouthScreen     = leftMouthSc,
+            rightMouthScreen    = rightMouthSc,
+            mouthMidpointScreen = midpointSc,
+            deviationMm         = deviationMm,
+            deviationDirection  = deviationDir,
+            confidence          = confidence,
+            trajectoryHistory   = ArrayList(currentTrajectory),
+            detectedPattern     = currentPattern,
+            faceMeshPoints = meshPoints
+        )
+
+        // ════════════════════════════════════════════════════════════
+        // 4. DETECCIÓN AUTOMÁTICA DE PICO MÁXIMO Y AUTO-CAPTURA
+        // ════════════════════════════════════════════════════════════
+        //
+        // Mientras isMeasuring = true, vamos guardando el mayor valor de
+        // apertura visto. Si la apertura empieza a bajar de forma
+        // sostenida (≥3mm de caída durante 4 frames seguidos), asumimos
+        // que el pico ya ocurrió y disparamos la captura automática con
+        // el MEJOR resultado registrado (no el actual, que ya va bajando).
+        if (isMeasuring && !hasPeakBeenAutoCaptured) {
+            if (openingMm >= MIN_OPEN_TO_TRACK_MM) {
+
+                if (openingMm > bestOpeningSoFar) {
+                    bestOpeningSoFar = openingMm
+                    bestResultSoFar  = currentResult.copy(isPeakCapture = true)
+                    descentFrameCount = 0
+
+                } else if (bestOpeningSoFar - openingMm >= MIN_DROP_TO_CONFIRM_MM) {
+                    descentFrameCount++
+                    if (descentFrameCount >= FRAMES_TO_CONFIRM_DESCENT) {
+                        hasPeakBeenAutoCaptured = true
+                        bestResultSoFar?.let { onAutoPeakDetected(it) }
+                    }
+                } else {
+                    descentFrameCount = 0
+                }
+            }
+        }
+
+        onResult(currentResult)
     }
 
     private fun analyzePattern(trajectory: List<Float>, currentDev: Float): OpeningPattern {
@@ -325,7 +447,7 @@ class FaceMeshAnalyzer(
     private fun countZeroCrossings(list: List<Float>): Int {
         var crossings = 0
         for (i in 0 until list.size - 1) {
-            if ((list[i] >= 0f && list[i+1] < 0f) || (list[i] < 0f && list[i+1] >= 0f)) {
+            if ((list[i] >= 0f && list[i + 1] < 0f) || (list[i] < 0f && list[i + 1] >= 0f)) {
                 crossings++
             }
         }
@@ -334,21 +456,9 @@ class FaceMeshAnalyzer(
 
     private fun resetTrajectory() {
         currentTrajectory.clear()
-        lastPeakResult = null
-    }
-
-    private fun isInsideOval(px: Float, py: Float, cx: Float, cy: Float, a: Float, b: Float): Boolean {
-        return ((px - cx) / a).pow(2) + ((py - cy) / b).pow(2) <= 1.0f
     }
 
     private fun distance2D(a: FaceMeshPoint, b: FaceMeshPoint): Float {
         return sqrt((a.position.x - b.position.x).pow(2) + (a.position.y - b.position.y).pow(2))
-    }
-
-    /** Mantenido por compatibilidad si se quiere capturar manualmente */
-    fun consumePeak(): MeasurementResult? {
-        val p = lastPeakResult
-        lastPeakResult = null
-        return p
     }
 }

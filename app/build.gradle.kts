@@ -24,10 +24,17 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Nombre limpio para la versión final
+            manifestPlaceholders["appLabel"] = "MyDentApp"
+        }
+
+        getByName("debug") {
+            applicationIdSuffix = ".debug"
+
+            // Nombre con el sufijo para identificarla en tu celular
+            manifestPlaceholders["appLabel"] = "MyDentApp [DEBUG]"
         }
     }
-
-
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
